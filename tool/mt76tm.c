@@ -41,6 +41,28 @@
 #include <linux/nl80211.h>
 
 /* ------------------------------------------------------------------
+ * NLA_OK / NLA_NEXT 补丁
+ *
+ * 这两个宏属于 libnl，**不在内核 UAPI 头文件里**。
+ * 内核的 <linux/netlink.h> 只提供 NLA_ALIGN / NLA_HDRLEN，
+ * 直接用 NLA_OK/NLA_NEXT 会编译报 "undeclared" —— 这是第一次云端
+ * 编译失败的原因（用户包在工具链和目标固件之后才编，所以跑到最后才炸）。
+ * 这里按 libnl 的定义自己补上，不引入 libnl 依赖。
+ * ------------------------------------------------------------------ */
+#ifndef NLA_OK
+#define NLA_OK(nla, len) \
+	((len) >= (int)sizeof(struct nlattr) && \
+	 (nla)->nla_len >= sizeof(struct nlattr) && \
+	 (nla)->nla_len <= (len))
+#endif
+
+#ifndef NLA_NEXT
+#define NLA_NEXT(nla, attrlen) \
+	((attrlen) -= NLA_ALIGN((nla)->nla_len), \
+	 (struct nlattr *)(((char *)(nla)) + NLA_ALIGN((nla)->nla_len)))
+#endif
+
+/* ------------------------------------------------------------------
  * mt76 testmode 属性号（不来自 uapi，抄自
  * drivers/net/wireless/mediatek/mt76/testmode.h，该枚举多年未变）
  * ------------------------------------------------------------------ */
@@ -124,6 +146,7 @@ static void nla_put_str(struct nlmsghdr *n, int m, int t, const char *s)
 static void nl_open(void)
 {
 	struct sockaddr_nl sa;
+	struct timeval tv;
 
 	nl_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
 	if (nl_fd < 0)
@@ -132,6 +155,11 @@ static void nl_open(void)
 	sa.nl_family = AF_NETLINK;
 	if (bind(nl_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
 		die("bind 失败");
+
+	/* 接收超时：万一内核不回包，也不要让工具永久卡住（路由器上很致命） */
+	tv.tv_sec = 3;
+	tv.tv_usec = 0;
+	setsockopt(nl_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 static int nl_send_recv(struct nlmsghdr *nlh, char *resp, int resp_len)
@@ -225,7 +253,9 @@ static int testmode_cmd(int ifindex, uint32_t state, int has_tx,
 	memset(buf, 0, sizeof(buf));
 	nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
 	nlh->nlmsg_type = nl80211_id;
-	nlh->nlmsg_flags = NLM_F_REQUEST;
+	/* 必须带 NLM_F_ACK：nl80211 的 TESTMODE 处理完不回包，
+	 * 不请求 ACK 的话下面的 recvmsg 会一直阻塞。 */
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
 	nlh->nlmsg_seq = nl_seq++;
 	gh = (struct genlmsghdr *)NLMSG_DATA(nlh);
 	gh->cmd = NL80211_CMD_TESTMODE;
@@ -249,13 +279,25 @@ static int testmode_cmd(int ifindex, uint32_t state, int has_tx,
 	}
 
 	td = nla_put(nlh, NL_BUFSZ, NL80211_ATTR_TESTDATA, NULL, 0);
+	/* STATE 用 u32：驱动里是 nla_get_u32() 读的，写成 u8 会读到垃圾 */
 	nla_put_u32(nlh, NL_BUFSZ, MT76_TM_ATTR_STATE, state);
 	if (has_tx) {
+		struct nlattr *tp;
+		uint8_t pw = (uint8_t)power;
+
 		nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_RATE_MODE, mode);
 		nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_RATE_IDX, mcs);
 		nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_RATE_NSS, nss);
 		nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_ANTENNA, antenna);
-		nla_put(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_POWER, &power, 1);
+
+		/* TX_POWER 是 NLA_NESTED：驱动用 nla_for_each_nested 逐项读，
+		 * 每项必须是长度正好 1 字节的 u8。直接发裸字节会被判 EINVAL。 */
+		tp = nla_put(nlh, NL_BUFSZ,
+			     MT76_TM_ATTR_TX_POWER | NLA_F_NESTED, NULL, 0);
+		nla_put(nlh, NL_BUFSZ, 0, &pw, 1);      /* 天线 0 的功率 */
+		if (tp)
+			tp->nla_len = (char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len)
+				      - (char *)tp;
 	}
 	td->nla_len = (char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len) - (char *)td;
 
@@ -303,10 +345,12 @@ int main(int argc, char **argv)
 	}
 
 	if (!strcmp(cmd, "status")) {
-		ret = testmode_cmd(ifidx, MT76_TM_STATE_IDLE, 0, 0, 0, 0, 0, 0, 0, 0);
+		/* 用 OFF 探测：驱动里 mt76_testmode_set_state(OFF) 在本来就已经
+		 * 是 OFF 时会直接 return 0，所以这是**非破坏性**的探针。
+		 * 如果 testmode 没编进去，mt76_testmode_cmd 开头就返回 -EOPNOTSUPP。 */
+		ret = testmode_cmd(ifidx, MT76_TM_STATE_OFF, 0, 0, 0, 0, 0, 0, 0, 0);
 		if (ret == 0) {
 			printf("testmode 可用 ✓\n");
-			testmode_cmd(ifidx, MT76_TM_STATE_OFF, 0, 0, 0, 0, 0, 0, 0, 0);
 			return 0;
 		}
 		printf("testmode 不可用: %s (%d)\n", strerror(-ret), -ret);
@@ -358,7 +402,25 @@ int main(int argc, char **argv)
 		if (ret < 0) {
 			fprintf(stderr, "失败: %s (%d)\n", strerror(-ret), -ret);
 			if (-ret == 95)
-				fprintf(stderr, "EOPNOTSUPP —— 固件没编 testmode\n");
+				fprintf(stderr,
+					"EOPNOTSUPP —— 固件没编 testmode\n"
+					"  需要内核开 CONFIG_NL80211_TESTMODE 重新编译 mt7915e\n");
+			else if (-ret == 107)
+				fprintf(stderr,
+					"ENOTCONN —— 射频不在 monitor 模式（驱动强制的）\n"
+					"  先用下面这套命令准备好，再发连续波：\n"
+					"    wifi down\n"
+					"    iw phy phy0 interface add mon0 type monitor\n"
+					"    ip link set mon0 up\n"
+					"    iw dev mon0 set channel %d\n"
+					"    %s cont mon0 -c %d -w %d\n",
+					chan, argv[0], chan, width);
+			else if (-ret == 22)
+				fprintf(stderr,
+					"EINVAL —— 参数被驱动拒绝。常见原因：\n"
+					"  · 带宽选了 40/80 但信道不支持\n"
+					"  · MCS 超出该模式范围（ofdm 只支持 0-8）\n"
+					"  · nss 超过天线数\n");
 			return 1;
 		}
 		printf("已进入连续发射。停止: %s off %s\n", argv[0], ifname);
