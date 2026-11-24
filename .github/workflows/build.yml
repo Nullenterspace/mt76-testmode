@@ -81,7 +81,20 @@ jobs:
           if ls out/*.ko >/dev/null 2>&1; then
             echo "=== 本次收集到的模块 ==="
             ls -la out/*.ko
+            echo
             python3 tool/ko_check.py out/*.ko
+            echo
+            echo "=== 整套齐全性检查（少一个都不许当成品）==="
+            miss=""
+            for m in compat cfg80211 mac80211 mt76 mt76-connac-lib mt7915e; do
+              n=$(echo "$m" | tr '-' '_')
+              ls out/*.ko | xargs -n1 basename | tr '-' '_' | grep -qx "${n}.ko" || miss="$miss $m"
+            done
+            if [ -n "$miss" ]; then
+              echo "!! 缺少:$miss —— 这套产物不能用，装上去会 panic"
+              exit 1
+            fi
+            echo "整套 6 个模块齐全 ✓"
           else
             echo "(out/ 里没有 .ko，跳过)"
           fi

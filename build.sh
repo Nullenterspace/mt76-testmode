@@ -155,11 +155,14 @@ do_build() {
 # ---------------------------------------------------------------- 收集
 # 这一整组 wifi 模块必须来自同一次构建！
 #   compat/cfg80211/mac80211 是一家（backports 包），
-#   mt76/mt76_connac_lib/mt7915e 是一家（mt76 包）。
+#   mt76/mt76-connac-lib/mt7915e 是一家（mt76 包）。
 # 只换其中一部分（比如只换 cfg80211+mt76+mt7915e，留着官方的 mac80211），
-# 两边的内部结构就会对不上，模板加载时会 panic——实测就是开不了机、
-# 网口都没链路，只能进 failsafe 或 U-Boot 救。
-WIFI_MODULES="compat cfg80211 mac80211 mt76 mt76_connac_lib mt7915e"
+# 两边的内部结构就会对不上，模块加载时会 panic——实测就是开不了机、
+# 网口都没链路，只能按 Reset 孔用 U-Boot 救。
+#
+# 注意 mt76-connac-lib 是**横杠**（设备上装的也是这个文件名，
+# 只有 lsmod 显示时才会变成下划线），写错就收不到，整套不齐。
+WIFI_MODULES="compat cfg80211 mac80211 mt76 mt76-connac-lib mt7915e"
 
 do_collect() {
     mkdir -p "$OUT"
@@ -170,14 +173,19 @@ do_collect() {
     kdir=$(find build_dir -maxdepth 4 -type d -name "linux-${TARGET}_${SUBTARGET}" | head -1)
     [ -n "$kdir" ] || die "找不到内核 build_dir"
 
+    # 注意：模块文件名可能带横杠也可能带下划线
+    #   设备上装的是 mt76-connac-lib.ko（lsmod 里显示才会变成 mt76_connac_lib）
+    # 这里两种写法都找，避免漏收导致整套不齐
     for m in $WIFI_MODULES; do
-        local f
-        f=$(find "$kdir" -name "${m}.ko" -type f | head -1)
+        local f alt_d alt_u
+        alt_d=$(echo "$m" | tr '_' '-')
+        alt_u=$(echo "$m" | tr '-' '_')
+        f=$(find "$kdir" \( -name "${m}.ko" -o -name "${alt_d}.ko" -o -name "${alt_u}.ko" \) -type f 2>/dev/null | head -1)
         if [ -n "$f" ]; then
-            cp "$f" "$OUT/"
-            log "  $m.ko  $(du -h "$f" | cut -f1)"
+            cp "$f" "$OUT/$(basename "$f")"
+            log "  $(basename "$f")  $(du -h "$f" | cut -f1)"
         else
-            log "  !! 没找到 $m.ko"
+            log "  !! 没找到 $m.ko（试过 $m / $alt_d / $alt_u）"
         fi
     done
 
@@ -191,6 +199,19 @@ do_collect() {
 
     log "产物清单："
     ls -la "$OUT"
+
+    # 整套必须齐全：少一个都不许当成品用（上次就是少收 3 个才变砖）
+    local have want miss=""
+    have=$(ls "$OUT"/*.ko 2>/dev/null | xargs -r -n1 basename | tr '-' '_')
+    for m in $WIFI_MODULES; do
+        want=$(echo "$m" | tr '-' '_')
+        echo "$have" | grep -qx "${want}.ko" || miss="$miss $m"
+    done
+    if [ -n "$miss" ]; then
+        log "!! 模块不全，缺:$miss —— 这套产物不能用"
+    else
+        log "整套 6 个模块齐全 ✓"
+    fi
 
     # 关键自检：模块能不能被目标内核加载，此时就能确定，不用等刷机失败
     log "自检 sizeof(struct module)（必须 640，否则 install 会失败）"
