@@ -58,6 +58,52 @@ MediaTek 开发者自己的描述：
                2402-2482 全频段 100% 饱和
 ```
 
+## 关键坑：模块必须和内核的 `struct module` 大小一致
+
+这是**最容易踩、报错也最莫名其妙**的一个坑，务必先看：
+
+```
+module cfg80211: .gnu.linkonce.this_module section size must match
+                 the kernel's built struct module size at run time
+```
+
+即使 vermagic、内核版本、架构全都对得上，只要 `struct module` 大小不一致，
+内核就拒绝加载（`insmod` 返回 255，`lsmod` 空空，`nl80211 not found`，无线全废）。
+
+- 每个 `.ko` 里的 `.gnu.linkonce.this_module` 段就是编译期的 `struct module`
+- 它的字节数由**内核配置**决定，最典型的影响项是 `CONFIG_KALLSYMS`
+  （开/关正好差 **64** 字节）
+
+实测数据：
+
+| 来源 | `sizeof(struct module)` | 结果 |
+|---|---|---|
+| 官方 25.12.1 模块 | **640** | 正常加载 |
+| 我们第一版（`make defconfig` 默认） | **704** | 加载失败 |
+
+根因：官方 release 的构建配置里明确写着
+
+```
+# CONFIG_KERNEL_KALLSYMS is not set
+```
+
+而自己手写 `.config` 再 `make defconfig`，`KERNEL_KALLSYMS` 会用默认值 **y**。
+
+**解决办法**：`build.sh` 现在直接拿官方的
+[`config.buildinfo`](https://downloads.openwrt.org/releases/25.12.1/targets/mediatek/filogic/config.buildinfo)
+当 `.config`（已存为本目录的 `config.buildinfo`），只改设备名和要编的包。
+这样所有这类隐藏选项都和官方一致。
+
+**编完立刻自检**，不用等刷机失败：
+
+```bash
+python3 tool/ko_check.py out/cfg80211.ko out/mt76.ko out/mt7915e.ko
+#   模块                     实测   结论
+#   cfg80211.ko              640   一致，能加载
+```
+
+`build.sh collect` 和 GitHub Actions 都会自动跑这一步。
+
 ## 编译（二选一）
 
 ### 方式 A：本地 WSL2（推荐，迭代快）
@@ -74,10 +120,20 @@ bash build.sh
 
 ### 方式 B：GitHub Actions 云编译（不动本地系统）
 
-1. 新建一个 GitHub 仓库
-2. 把本目录所有文件传上去（含 `.github/workflows/build.yml`）
-3. 仓库页面 → Actions → "Build mt76 testmode modules" → Run workflow
-4. 等 40-90 分钟，在 Artifacts 里下载 `mt76-testmode-modules.zip`
+仓库：<https://github.com/Nullenterspace/mt76-testmode>
+
+推代码就自动编（`concurrency.cancel-in-progress`，新一轮会取消上一轮，省额度）：
+
+```bash
+git push origin main
+```
+
+等 40~90 分钟，在 Actions 页面 → 最新一次运行 → Artifacts 里下载
+`mt76-testmode-modules.zip`（含三个 `.ko` + `mt76tm`）。
+同一页面还有 `build-log` 便于排错。
+
+> 注意：`.gitattributes` 里强制 `*.sh` 等用 LF，缺了它 Linux runner 会报
+> `/bin/bash^M: bad interpreter`。
 
 产物一样。
 
@@ -96,67 +152,86 @@ bash build.sh
 
 **不刷固件**，只替换内核模块，可随时回滚。
 
+现成脚本（自动备份 → 上传 → 重启 → 校验 → 报错就提示回滚）：
+
 ```bash
-# 1. 先备份原模块
-ssh root@192.168.1.1 '
-  mkdir -p /root/kmod-backup &&
-  cp /lib/modules/6.12.74/cfg80211.ko   /root/kmod-backup/ &&
-  cp /lib/modules/6.12.74/mt76.ko       /root/kmod-backup/ &&
-  cp /lib/modules/6.12.74/mt7915e.ko    /root/kmod-backup/
-'
-
-# 2. 传新模块和工具
-scp out/cfg80211.ko out/mt76.ko out/mt7915e.ko root@192.168.1.1:/lib/modules/6.12.74/
-scp out/mt76tm root@192.168.1.1:/usr/bin/
-ssh root@192.168.1.1 'chmod +x /usr/bin/mt76tm'
-
-# 3. 重启
-ssh root@192.168.1.1 reboot
+# 把下载的产物解到 out/ 里，然后一条命令
+python tools/testmode.py install --node 1
 ```
 
-## 验证
+<details>
+<summary>手打命令（等价）</summary>
 
 ```bash
-# 探测 testmode 是否可用
-mt76tm status phy0-ap0
-# 期望输出：testmode 可用 ✓
+ssh root@192.168.1.1 '
+  mkdir -p /root/kmod-backup &&
+  cp /lib/modules/6.12.74/cfg80211.ko /lib/modules/6.12.74/mt76.ko \
+     /lib/modules/6.12.74/mt7915e.ko /root/kmod-backup/
+'
+# 路由器没装 sftp-server，scp 可能失败；用 cat 传更稳：
+cat out/cfg80211.ko | ssh root@192.168.1.1 'cat > /lib/modules/6.12.74/cfg80211.ko'
+# …mt76.ko / mt7915e.ko 同理，再传 mt76tm 到 /usr/bin/ 并 chmod +x
+ssh root@192.168.1.1 'sync; reboot'
+```
+</details>
 
-# 开始连续发射（单台 40MHz）
-mt76tm cont phy0-ap0 -c 1 -w 40 -m ht -M 7 -n 2
+重启后必须**验证模块真的加载了**，别急着下一步：
 
-# 看空口占用（另开一个 ssh，或在电脑上看监控面板）
-iw dev phy0-ap0 survey dump | grep -A6 'in use'
-# 期望 tx 接近 100%
+```bash
+python tools/testmode.py check --node 1    # 期望：testmode 可用 ✓
+```
 
-# 停止
-mt76tm off phy0-ap0
+如果 `lsmod` 里没有 `mt7915e`，看 `dmesg | grep this_module`，
+然后 `python tools/testmode.py rollback --node 1`。
+
+## 验证连续波
+
+**testmode 要求射频处于 monitor 模式**（驱动里硬性检查
+`hw->conf.flags & IEEE80211_CONF_MONITOR`），否则报 `ENOTCONN (-107)`。
+所以流程是「关 AP → 建 monitor → 发射」。全套一条命令：
+
+```bash
+python tools/testmode.py cw --node 1 -c 1 -w 40 -m ht -M 7 -n 2 -a 3
+```
+
+它会依次：`wifi down` → 建 `mon0` → `iw dev mon0 set freq` →
+`mt76tm cont mon0 …` → 读 `iw survey` 报 `busy/rx/tx`。
+
+关键判据：**tx 接近 100%** 才说明纯载波真的占满信道（beacon 方案单台最多 44%）。
+
+```bash
+# 停连续波并恢复干扰配置
+python tools/testmode.py restore --node 1
 ```
 
 ## 回滚
 
 ```bash
-ssh root@192.168.1.1 '
-  cp /root/kmod-backup/*.ko /lib/modules/6.12.74/
-  reboot
-'
+python tools/testmode.py rollback --node 1
 ```
 
-或者直接断电重启也没用——要恢复必须换回旧模块。
+（内部就是 `cp /root/ko-bak-testmode/*.ko /lib/modules/6.12.74/ && reboot`）
+断电重启没用——模块在 overlay 上，必须换回旧文件。
 
 ## 已知风险
 
-1. **vermagic 必须匹配**。用同一版本 OpenWrt（v25.12.1）编译出来的模块 vermagic 应该一致
-   （`6.12.74 SMP mod_unload aarch64`）。如果 `insmod` 报 vermagic 不符，说明版本没对上。
+1. **`struct module` 必须一致**（见上文「关键坑」）。vermagic 对了不代表能装，
+   靠 `tool/ko_check.py` 提前确认 640 字节。
 2. **testmode 会独占射频**，那台机器不能再当 AP 用，也没有 SSH over WiFi。
-   所以操作全程走网线，且必须先用 `mt76tm off` 恢复。
+   所以操作全程走网线，且必须先用 `mt76tm off` / `restore` 恢复。
 3. **替换 cfg80211.ko 比较敏感**，但可回滚，且不动固件分区。
+4. 连续波是纯物理层信号，**自己也在被干扰**——测鼠标时电脑别连这台机器的 WiFi。
 
 ## 目录结构
 
 ```
 firmware-build/
 ├── build.sh                          # 主编译脚本
-├── tool/mt76tm.c                     # 工具源码（纯 netlink，无依赖）
+├── config.buildinfo                  # 官方 25.12.1 构建配置（必须，决定 struct module）
+├── tool/
+│   ├── mt76tm.c                      # 工具源码（纯 netlink，无依赖）
+│   └── ko_check.py                   # 产物自检：sizeof(struct module) 是否为 640
 ├── package/mt76tm-Makefile           # 打成 OpenWrt 软件包用
+├── .gitattributes                    # 强制 LF，否则 runner 上 build.sh 跑不了
 └── .github/workflows/build.yml       # 云端编译
 ```
