@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <net/if.h>
 #include <linux/netlink.h>
 #include <linux/genetlink.h>
