@@ -67,24 +67,54 @@ do_source() {
 # ---------------------------------------------------------------- 配置
 do_config() {
     cd "$SRC"
-    log "写 .config"
+    log "写 .config（以官方 release 的 config.buildinfo 为底）"
 
-    cat > .config <<EOF
+    # ------------------------------------------------------------------
+    # 为什么必须用官方 config.buildinfo 当底？
+    #
+    # 官方 25.12.1 里有一句  "# CONFIG_KERNEL_KALLSYMS is not set"
+    # （https://downloads.openwrt.org/releases/25.12.1/targets/mediatek/filogic/config.buildinfo）
+    #
+    # CONFIG_KALLSYMS 会给 struct module 加上 kallsyms / core_kallsyms 等字段，
+    # 结构体大小从 640 变成 704。模块的 .gnu.linkonce.this_module 段里存的
+    # 就是 struct module，内核加载时会比对大小，不一致就报：
+    #   "this_module section size must match the kernel's built
+    #    struct module size at run time"     -> insmod 直接失败
+    #
+    # 自己手写 .config 再 make defconfig，KALLSYMS 会用默认值 y，
+    # 编出来的模块就装不上去。所以这里整份照抄官方构建配置。
+    # ------------------------------------------------------------------
+    [ -f "$ROOT/config.buildinfo" ] || die "缺少 $ROOT/config.buildinfo"
+    cp "$ROOT/config.buildinfo" .config
+
+    # 官方那份是"给全部设备、全部 kmod 出包"的构建机器人配置，我们只要一台设备
+    sed -i -E '/^CONFIG_TARGET_DEVICE_/d'          .config
+    sed -i -E '/^CONFIG_TARGET_DEVICE_PACKAGES_/d' .config
+    sed -i -E '/^CONFIG_TARGET_ALL_PROFILES=/d'    .config
+    sed -i -E '/^CONFIG_TARGET_MULTI_PROFILE=/d'   .config
+    sed -i -E '/^CONFIG_ALL_KMODS=/d'              .config
+    sed -i -E '/^CONFIG_ALL_NONSHARED=/d'          .config
+    # 去掉调试信息 / SDK / luci 等，缩短编译时间（都不影响 struct module）
+    sed -i -E '/^CONFIG_(IB|SDK|SDK_LLVM_BPF|BUILDBOT|JSON_CYCLONEDX_SBOM|DEVEL|COLLECT_KERNEL_DEBUG|REPRODUCIBLE_DEBUG_INFO)=/d' .config
+    sed -i -E '/^CONFIG_PACKAGE_(luci|ucode-mod|rpcd|uhttpd|owut|px5g|cgi-io|attendedsysupgrade|libiwinfo|liblucihttp)/d' .config
+
+    cat >> .config <<EOF
 CONFIG_TARGET_${TARGET}=y
 CONFIG_TARGET_${TARGET}_${SUBTARGET}=y
-CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y
 CONFIG_TARGET_MULTI_PROFILE=n
-# 只编我们需要的，减小体积、加快速度
-CONFIG_PACKAGE_wpad-basic-mbedtls=y
+CONFIG_TARGET_DEVICE_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y
+CONFIG_TARGET_DEVICE_PACKAGES_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=""
+# CONFIG_KERNEL_KALLSYMS is not set
 CONFIG_PACKAGE_iw=y
-CONFIG_PACKAGE_dropbear=y
-CONFIG_PACKAGE_libustream-mbedtls=y
-CONFIG_STRIP_KERNEL_EXPORTS=y
-CONFIG_DEBUG_INFO=n
-CONFIG_SIGNED_PACKAGES=n
+CONFIG_PACKAGE_mt76tm=y
 EOF
 
     make defconfig >/dev/null || die "defconfig 失败"
+
+    # 万一 defconfig 又把 KALLSYMS 打开了，这里立刻拦下来，别白编 40 分钟
+    grep -q '^# CONFIG_KERNEL_KALLSYMS is not set' .config \
+        || die "CONFIG_KERNEL_KALLSYMS 没关掉！struct module 会不一致"
+    log "  KALLSYMS 保持关闭（struct module = 640 字节）"
 
     log "打开 CONFIG_NL80211_TESTMODE"
     local cfg="target/linux/${TARGET}/${SUBTARGET}/config-${KERNEL_VER}"
@@ -153,6 +183,12 @@ do_collect() {
 
     log "产物清单："
     ls -la "$OUT"
+
+    # 关键自检：模块能不能被目标内核加载，此时就能确定，不用等刷机失败
+    log "自检 sizeof(struct module)（必须 640，否则 install 会失败）"
+    python3 "$ROOT/tool/ko_check.py" \
+        "$OUT/cfg80211.ko" "$OUT/mt76.ko" "$OUT/mt7915e.ko" \
+        || log "!! 自检未通过：模块装不上，别急着刷"
 }
 
 # ---------------------------------------------------------------- 主流程

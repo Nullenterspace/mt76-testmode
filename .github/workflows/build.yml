@@ -7,6 +7,11 @@ on:
   push:
     branches: [ main, master ]
 
+# 新一轮 push 直接取消上一轮，避免同时跑两份白烧额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -63,6 +68,21 @@ jobs:
           ls -la out/ 2>/dev/null || echo "(空)"
           echo "=== 尝试从 build_dir 直接找 .ko ==="
           find openwrt/build_dir -name "mt7915e.ko" -o -name "mt76.ko" -o -name "cfg80211.ko" 2>/dev/null | head
+
+      - name: 自检 struct module 大小
+        if: always()
+        run: |
+          echo "=== .config 里的 KALLSYMS ==="
+          grep -n 'KALLSYMS' openwrt/.config 2>/dev/null || echo "(没找到)"
+          echo
+          echo "=== 内核实际配置（生成后）==="
+          find openwrt/build_dir -name '.config' -path '*linux*' 2>/dev/null | head -1 | xargs -r grep -n 'KALLSYMS' 2>/dev/null || true
+          echo
+          if ls out/*.ko >/dev/null 2>&1; then
+            python3 tool/ko_check.py out/cfg80211.ko out/mt76.ko out/mt7915e.ko
+          else
+            echo "(out/ 里没有 .ko，跳过)"
+          fi
 
       - name: 上传产物
         if: always()
