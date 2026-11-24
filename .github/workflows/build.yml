@@ -79,7 +79,9 @@ jobs:
           find openwrt/build_dir -name '.config' -path '*linux*' 2>/dev/null | head -1 | xargs -r grep -n 'KALLSYMS' 2>/dev/null || true
           echo
           if ls out/*.ko >/dev/null 2>&1; then
-            python3 tool/ko_check.py out/cfg80211.ko out/mt76.ko out/mt7915e.ko
+            echo "=== 本次收集到的模块 ==="
+            ls -la out/*.ko
+            python3 tool/ko_check.py out/*.ko
           else
             echo "(out/ 里没有 .ko，跳过)"
           fi
