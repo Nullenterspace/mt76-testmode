@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# mt76tm —— mt76 testmode 连续发射控制器
+#
+# 编译成 OpenWrt 软件包，产出 mt76tm_1.0-1_aarch64_cortex-a53.ipk，
+# 可以用 opkg install 直接装进路由器。
+#
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=mt76tm
+PKG_VERSION:=1.0
+PKG_RELEASE:=1
+
+PKG_BUILD_PARALLEL:=1
+PKG_BUILD_FLAGS:=no-mips16
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/mt76tm
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=mt76 testmode continuous TX controller
+  DEPENDS:=+kmod-cfg80211
+endef
+
+define Package/mt76tm/description
+  Sends NL80211_CMD_TESTMODE with MT76_TM_STATE_TX_CONT to make mt7915/mt7976
+  emit a gap-free physical-layer signal (continuous wave) on a chosen channel.
+  Requires a kernel built with CONFIG_NL80211_TESTMODE=y.
+endef
+
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/* $(PKG_BUILD_DIR)/
+endef
+
+define Build/Configure
+endef
+
+define Build/Compile
+	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
+		-o $(PKG_BUILD_DIR)/mt76tm $(PKG_BUILD_DIR)/mt76tm.c
+endef
+
+define Package/mt76tm/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/mt76tm $(1)/usr/bin/mt76tm
+endef
+
+$(eval $(call BuildPackage,mt76tm))
