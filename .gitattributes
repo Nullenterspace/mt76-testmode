@@ -1,0 +1,9 @@
+# 保证脚本在仓库里以 LF 存储，否则在 Linux runner 上会
+# 报 /bin/bash^M: bad interpreter
+* text=auto
+*.sh text eol=lf
+*.c text eol=lf
+*.yml text eol=lf
+Makefile text eol=lf
+*.buildinfo text eol=lf
+*.py text eol=lf
