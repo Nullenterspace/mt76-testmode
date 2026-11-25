@@ -208,12 +208,18 @@ do_collect() {
     # 直接刷这个镜像则是「一次编译、内核+驱动+testmode 全同源」，
     # 而且 U-Boot 的 upgrade_fw 只重写 fit 卷，不碰 overlay 和 bootloader。
     # ------------------------------------------------------------------
-    log "收集完整固件镜像（sysupgrade）"
-    local img
-    for img in $(find bin/targets -name "openwrt-*-squashfs-sysupgrade.itb" -type f 2>/dev/null); do
+    log "收集完整固件镜像（只收本机型的，别把别的设备镜像也收进来）"
+    local img n_img=0
+    for img in $(find bin/targets -name "*${DEVICE}*-squashfs-sysupgrade.itb" -type f 2>/dev/null); do
         cp "$img" "$OUT/"
+        n_img=$((n_img + 1))
         log "  $(basename "$img")  $(du -h "$img" | cut -f1)"
     done
+    if [ "$n_img" -eq 0 ]; then
+        log "!! 没找到包含 ${DEVICE} 的 sysupgrade 镜像"
+        log "   同 target 下实际产出的镜像："
+        find bin/targets -name "*.itb" -type f 2>/dev/null | sed 's|.*/|   |'
+    fi
 
     log "产物清单："
     ls -la "$OUT"
