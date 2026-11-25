@@ -91,17 +91,27 @@ do_config() {
     sed -i -E '/^CONFIG_TARGET_DEVICE_/d'          .config
     sed -i -E '/^CONFIG_TARGET_DEVICE_PACKAGES_/d' .config
     sed -i -E '/^CONFIG_TARGET_ALL_PROFILES=/d'    .config
-    sed -i -E '/^CONFIG_TARGET_MULTI_PROFILE=/d'   .config
+    sed -i -E '/^CONFIG_TARGET_PROFILE=/d'         .config
     sed -i -E '/^CONFIG_ALL_KMODS=/d'              .config
     sed -i -E '/^CONFIG_ALL_NONSHARED=/d'          .config
     # 去掉调试信息 / SDK / luci 等，缩短编译时间（都不影响 struct module）
     sed -i -E '/^CONFIG_(IB|SDK|SDK_LLVM_BPF|BUILDBOT|JSON_CYCLONEDX_SBOM|DEVEL|COLLECT_KERNEL_DEBUG|REPRODUCIBLE_DEBUG_INFO)=/d' .config
     sed -i -E '/^CONFIG_PACKAGE_(luci|ucode-mod|rpcd|uhttpd|owut|px5g|cgi-io|attendedsysupgrade|libiwinfo|liblucihttp)/d' .config
 
+    # ------------------------------------------------------------------
+    # 选机型：必须用 MULTI_PROFILE=y + CONFIG_TARGET_DEVICE_xxx=y
+    #
+    # 踩过的坑：写成 CONFIG_TARGET_MULTI_PROFILE=n + CONFIG_TARGET_DEVICE_xxx=y 时，
+    # OpenWrt **不认**那个 DEVICE_ 符号（它只在 multi-profile 下生效），
+    # defconfig 会退回 target 的默认机型（mediatek/filogic 的默认是 openwrt_one）。
+    # 因为内核和内核模块只跟 target 走、跟机型无关，编出来的 .ko 一直是好的，
+    # 直到需要完整固件镜像时才暴露——产出的是 openwrt_one 的镜像。
+    # ------------------------------------------------------------------
     cat >> .config <<EOF
 CONFIG_TARGET_${TARGET}=y
 CONFIG_TARGET_${TARGET}_${SUBTARGET}=y
-CONFIG_TARGET_MULTI_PROFILE=n
+CONFIG_TARGET_MULTI_PROFILE=y
+CONFIG_TARGET_PROFILE="DEVICE_${DEVICE}"
 CONFIG_TARGET_DEVICE_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y
 CONFIG_TARGET_DEVICE_PACKAGES_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=""
 # CONFIG_KERNEL_KALLSYMS is not set
@@ -110,6 +120,11 @@ CONFIG_PACKAGE_mt76tm=y
 EOF
 
     make defconfig >/dev/null || die "defconfig 失败"
+
+    # 机型没选对就不要往下编了（否则白编一小时，还产出一台别家机器的镜像）
+    grep -q "^CONFIG_TARGET_DEVICE_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y" .config \
+        || die "机型 ${DEVICE} 没选上，检查 MULTI_PROFILE / TARGET_DEVICE 写法"
+    log "  机型确认：$(grep -E '^CONFIG_TARGET_PROFILE=' .config | head -1)"
 
     # 万一 defconfig 又把 KALLSYMS 打开了，这里立刻拦下来，别白编 40 分钟
     grep -q '^# CONFIG_KERNEL_KALLSYMS is not set' .config \
