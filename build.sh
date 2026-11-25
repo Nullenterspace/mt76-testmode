@@ -6,10 +6,20 @@
 #   *.ko            三个内核模块：cfg80211 / mt76 / mt7915e
 #   mt76tm          aarch64 工具（也可打包成 .ipk）
 #
-# 为什么只需要这三个模块：
-#   mt7915/Makefile 里写着  mt7915e-$(CONFIG_NL80211_TESTMODE) += testmode.o
-#   所以 testmode（含连续波 TX_CONT）完全由 CONFIG_NL80211_TESTMODE 控制。
-#   打开它需要重编 cfg80211（命令入口在这）、mt76（公共部分）、mt7915e（实现）。
+# testmode 开关在哪（踩过大坑，务必按这个来）：
+#   mt76 的 Makefile 里写着  mt7915e-$(CONFIG_NL80211_TESTMODE) += mt7915/testmode.o，
+#   但 cfg80211 / mac80211 是 **backports（package/kernel/mac80211）**，不是内核树里的代码。
+#   所以真正要在 buildroot .config 里打开的是软件包选项：
+#       CONFIG_PACKAGE_CFG80211_TESTMODE=y
+#   它由 package/kernel/mac80211/Makefile 里的
+#       define KernelPackage/cfg80211/config → config PACKAGE_CFG80211_TESTMODE (default n)
+#   定义，再由  config-$(CONFIG_PACKAGE_CFG80211_TESTMODE) += NL80211_TESTMODE
+#   翻译成 backports 的 CONFIG_NL80211_TESTMODE。
+#
+#   ❌ 反例（2026-11-25 实测）：把 CONFIG_NL80211_TESTMODE=y 写进
+#      target/linux/mediatek/filogic/config-6.12 完全无用——那个文件只喂内核，
+#      而驱动是外部 backports 模块，编出来的 .ko 里连一个 testmode 符号都没有，
+#      刷进去跑 mt76tm 只会得到 "Not supported (95)"。
 #
 # 用法：
 #   bash build.sh                 # 全流程
@@ -115,6 +125,9 @@ CONFIG_TARGET_PROFILE="DEVICE_${DEVICE}"
 CONFIG_TARGET_DEVICE_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y
 CONFIG_TARGET_DEVICE_PACKAGES_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=""
 # CONFIG_KERNEL_KALLSYMS is not set
+# CONFIG_PACKAGE_kmod-cfg80211 必须先开，PACKAGE_CFG80211_TESTMODE 才会出现在菜单里
+CONFIG_PACKAGE_kmod-cfg80211=y
+CONFIG_PACKAGE_CFG80211_TESTMODE=y
 CONFIG_PACKAGE_iw=y
 CONFIG_PACKAGE_mt76tm=y
 EOF
@@ -131,14 +144,13 @@ EOF
         || die "CONFIG_KERNEL_KALLSYMS 没关掉！struct module 会不一致"
     log "  KALLSYMS 保持关闭（struct module = 640 字节）"
 
-    log "打开 CONFIG_NL80211_TESTMODE"
-    local cfg="target/linux/${TARGET}/${SUBTARGET}/config-${KERNEL_VER}"
-    [ -f "$cfg" ] || die "找不到 $cfg"
+    log "打开 CONFIG_PACKAGE_CFG80211_TESTMODE（backports 侧才会带 NL80211_TESTMODE）"
 
-    # 先删掉可能存在的旧行（-m / # CONFIG_... is not set），再追加
-    sed -i '/^CONFIG_NL80211_TESTMODE/d' "$cfg"
-    sed -i '/^# CONFIG_NL80211_TESTMODE is not set/d' "$cfg"
-    echo "CONFIG_NL80211_TESTMODE=y" >> "$cfg"
+    # 关键断言：defconfig 会把「没有 Config.in 定义」的符号悄悄删掉，
+    # 所以必须在 defconfig 之后再查一次，编之前就拦住。
+    grep -q '^CONFIG_PACKAGE_CFG80211_TESTMODE=y' .config \
+        || die "CONFIG_PACKAGE_CFG80211_TESTMODE 没保住（defconfig 删了？检查是否定义了该符号）"
+    log "  testmode 开关已确认：CONFIG_PACKAGE_CFG80211_TESTMODE=y"
 
     log "插入自定义软件包 mt76tm"
     mkdir -p package/mt76tm/src
@@ -150,8 +162,8 @@ EOF
     make defconfig >/dev/null
 
     log "确认配置："
-    grep -c "CONFIG_NL80211_TESTMODE=y" "$cfg" || die "写入失败"
-    grep -c "CONFIG_PACKAGE_mt76tm=y" .config || die "mt76tm 未启用"
+    grep -q '^CONFIG_PACKAGE_CFG80211_TESTMODE=y' .config || die "testmode 开关丢失"
+    grep -q '^CONFIG_PACKAGE_mt76tm=y' .config || die "mt76tm 未启用"
     log "配置完成"
 }
 
@@ -256,6 +268,25 @@ do_collect() {
     log "自检 sizeof(struct module)（必须 640，否则 install 会失败）"
     python3 "$ROOT/tool/ko_check.py" "$OUT"/*.ko \
         || log "!! 自检未通过：模块装不上，别急着刷"
+
+    # 关键自检 2：testmode 代码到底编进去了没有
+    # （2026-11-25 的教训：开关写错位置 → 编译、打包、刷机全都"成功"，
+    #   刷完才发现 mt76tm 报 Not supported(95)，白折腾一整轮）
+    log "自检 testmode 代码是否编进模块"
+    local tm_bad=""
+    for m in cfg80211 mac80211 mt7915e; do
+        [ -f "$OUT/$m.ko" ] || continue
+        if ! grep -aq "testmode" "$OUT/$m.ko"; then
+            tm_bad="$tm_bad $m"
+        fi
+    done
+    if [ -n "$tm_bad" ]; then
+        log "!! 这些模块里找不到 testmode 符号:$tm_bad"
+        log "   => 开关没生效，别刷机（刷了 mt76tm 也只会报 Not supported 95）"
+        log "   => 检查 .config 里的 CONFIG_PACKAGE_CFG80211_TESTMODE=y"
+    else
+        log "testmode 代码已在模块内 ✓"
+    fi
 }
 
 # ---------------------------------------------------------------- 主流程
