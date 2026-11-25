@@ -15,16 +15,24 @@
  *
  * 用法：
  *   mt76tm status <ifname>             探测 testmode 是否可用
- *   mt76tm cont   <ifname> [选项]      开始连续发射
+ *   mt76tm check  <ifname>             只读：读回内核里的当前 testmode 状态
+ *   mt76tm cont   <ifname> [选项]      连续波（纯载波）
+ *   mt76tm frames <ifname> [选项]      灌包（走 MAC 队列，duty/ipg 可调）
  *   mt76tm off    <ifname>             停止，恢复正常工作
+ *
+ * 两个坑（都实测踩过，改代码前先看）：
+ *  1. MT76_TM_ATTR_STATE 的 nla_policy 是 NLA_U8，而驱动用 nla_get_u32 读。
+ *     必须按 u8 发！按 u32 发会被 nla_parse_deprecated 判为长度非法并**丢弃**，
+ *     命令照样返回 0，但状态没变 —— 看起来"成功"，实际一点波都不发。
+ *  2. 所以设完状态必须用 dump 读回 state 核对（本工具的 check/cont/frames 都自动做）。
  *
  * 连续发射选项：
  *   -c <信道>   1-13，默认 1
  *   -w <带宽>   20|40|80，默认 20
- *   -m <模式>   cck|ofdm|ht|vht|he，默认 ofdm
- *   -M <MCS>    0-11，默认 0
- *   -n <流数>   1-2，默认 1
- *   -a <天线>   1|3，默认 1
+ *   -m <模式>   cck|ofdm|ht|vht|he
+ *   -M <MCS>    0-11
+ *   -n <流数>   1-2
+ *   -a <天线>   1|3
  *   -p <功率>   0-31，默认 20
  */
 
@@ -280,8 +288,16 @@ static int testmode_cmd(int ifindex, uint32_t state, int has_tx,
 	}
 
 	td = nla_put(nlh, NL_BUFSZ, NL80211_ATTR_TESTDATA, NULL, 0);
-	/* STATE 用 u32：驱动里是 nla_get_u32() 读的，写成 u8 会读到垃圾 */
-	nla_put_u32(nlh, NL_BUFSZ, MT76_TM_ATTR_STATE, state);
+	/* ⚠️ STATE 必须按 **u8** 发：
+	 *   mt76 的 nla_policy 里  [MT76_TM_ATTR_STATE] = { .type = NLA_U8 }
+	 *   但驱动代码里又是        state = nla_get_u32(tb[MT76_TM_ATTR_STATE])
+	 * 这两处不一致。按 u32（4 字节）发时，nla_parse_deprecated 会打印
+	 *   netlink: 'mt76tm': attribute type 2 has an invalid length.
+	 * 然后把这条属性**丢掉**（liberal 模式不算错），于是 tb[STATE]==NULL，
+	 * 驱动认为"没改状态"，命令返回 0、什么都不做 —— 2026-11-25 就是被这个坑了一轮，
+	 * 工具打印"已进入连续发射"，实际一点波都没发。
+	 * 按 u8 发则属性合法；nla_get_u32 读到的 1 字节 + 3 字节补零，值仍然正确。 */
+	nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_STATE, (uint8_t)state);
 	if (has_tx) {
 		struct nlattr *tp;
 		uint8_t pw = (uint8_t)power;
@@ -305,22 +321,246 @@ static int testmode_cmd(int ifindex, uint32_t state, int has_tx,
 	return nl_send_recv(nlh, buf, sizeof(buf));
 }
 
+/* ---------------- TX_FRAMES 模式：走 MAC 队列灌包 ----------------
+ * 为什么要这条路：TX_CONT 依赖固件的 MCU_EXT_CMD(RF_TEST)，
+ * 在 MT7981 + 这版 WM 固件上实测会 "Retry message / Message timeout"
+ * 然后固件自己重启（dmesg 里能看到 Hardware restart was requested）。
+ * TX_FRAMES 不碰那条命令，只写 TM_MAC_TX 寄存器和 MAC 队列，
+ * duty=99 + ipg=0 时是背靠背发帧，最接近占满空口。
+ * 注意：TX_COUNT 必须给个大数，0 表示"不发"，不是"无线发"。
+ */
+static int testmode_frames_cmd(int ifindex, int state, int chan, int width,
+			       int mode, int mcs, int nss, int antenna, int power,
+			       int length, int ipg, int duty, int txtime,
+			       uint32_t count)
+{
+	char buf[NL_BUFSZ];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *gh;
+	struct nlattr *td, *tp;
+	uint8_t pw = (uint8_t)power;
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	nlh->nlmsg_type = nl80211_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq = nl_seq++;
+	gh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	gh->cmd = NL80211_CMD_TESTMODE;
+	gh->version = 0;
+
+	if (ifindex > 0)
+		nla_put_u32(nlh, NL_BUFSZ, NL80211_ATTR_IFINDEX, ifindex);
+	if (chan)
+		nla_put_u32(nlh, NL_BUFSZ, NL80211_ATTR_WIPHY_FREQ,
+			    (chan == 14) ? 2484 : (2407 + chan * 5));
+	if (width) {
+		uint32_t w = NL80211_CHAN_WIDTH_20_NOHT;
+		if (width == 40)
+			w = NL80211_CHAN_WIDTH_40;
+		else if (width == 80)
+			w = NL80211_CHAN_WIDTH_80;
+		nla_put_u32(nlh, NL_BUFSZ, NL80211_ATTR_CHANNEL_WIDTH, w);
+	}
+
+	td = nla_put(nlh, NL_BUFSZ, NL80211_ATTR_TESTDATA, NULL, 0);
+	nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_STATE, (uint8_t)state);
+	nla_put_u32(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_COUNT, count);
+	nla_put_u32(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_LENGTH, (uint32_t)length);
+	nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_RATE_MODE, (uint8_t)mode);
+	nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_RATE_IDX, (uint8_t)mcs);
+	nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_RATE_NSS, (uint8_t)nss);
+	nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_ANTENNA, (uint8_t)antenna);
+	nla_put_u8(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_DUTY_CYCLE, (uint8_t)duty);
+	nla_put_u32(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_IPG, (uint32_t)ipg);
+	nla_put_u32(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_TIME, (uint32_t)txtime);
+
+	tp = nla_put(nlh, NL_BUFSZ, MT76_TM_ATTR_TX_POWER | NLA_F_NESTED, NULL, 0);
+	nla_put(nlh, NL_BUFSZ, 0, &pw, 1);
+	if (tp)
+		tp->nla_len = (char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len) - (char *)tp;
+	td->nla_len = (char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len) - (char *)td;
+
+	return nl_send_recv(nlh, buf, sizeof(buf));
+}
+
+/* ---------------- 读回内核里的真实状态（验证命令到底生效没有） ----------------
+ * 只设不算：2026-11-25 那次工具报"已进入连续发射"，其实属性被内核丢掉、
+ * 状态根本没变。所以现在设完必须 dump 一次把 state 读回来比对。
+ */
+static const char *state_name(uint32_t s)
+{
+	switch (s) {
+	case 0: return "OFF 关闭";
+	case 1: return "IDLE";
+	case 2: return "TX_FRAMES 灌包";
+	case 3: return "RX_FRAMES";
+	case 4: return "TX_CONT 连续波";
+	case 5: return "ON";
+	}
+	return "未知";
+}
+
+static int nl_dump(int ifindex, char *resp, int resp_len)
+{
+	char req[512];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)req;
+	struct genlmsghdr *gh;
+	struct sockaddr_nl sa;
+	struct iovec iov;
+	struct msghdr msg;
+	int total = 0;
+
+	memset(req, 0, sizeof(req));
+	nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	nlh->nlmsg_type = nl80211_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlh->nlmsg_seq = nl_seq++;
+	gh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	gh->cmd = NL80211_CMD_TESTMODE;
+	gh->version = 0;
+	if (ifindex > 0)
+		nla_put_u32(nlh, sizeof(req), NL80211_ATTR_IFINDEX, ifindex);
+
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	iov.iov_base = nlh;
+	iov.iov_len = nlh->nlmsg_len;
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_name = &sa;
+	msg.msg_namelen = sizeof(sa);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	if (sendmsg(nl_fd, &msg, 0) < 0)
+		return -errno;
+
+	while (total < resp_len - 512) {
+		struct nlmsghdr *h;
+		int n, rem, done = 0;
+
+		iov.iov_base = resp + total;
+		iov.iov_len = resp_len - total;
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_name = &sa;
+		msg.msg_namelen = sizeof(sa);
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		n = recvmsg(nl_fd, &msg, 0);
+		if (n <= 0)
+			break;
+		rem = n;
+		for (h = (struct nlmsghdr *)(resp + total); NLMSG_OK(h, rem);
+		     h = NLMSG_NEXT(h, rem)) {
+			if (h->nlmsg_type == NLMSG_DONE) {
+				done = 1;
+				break;
+			}
+			if (h->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
+				return e->error ? e->error : total + n;
+			}
+		}
+		total += NLMSG_ALIGN(n);
+		if (done)
+			break;
+	}
+	return total;
+}
+
+static int show_state(int ifindex)
+{
+	char resp[NL_BUFSZ];
+	struct nlmsghdr *h;
+	int total, rem, have = 0;
+
+	total = nl_dump(ifindex, resp, sizeof(resp));
+	if (total <= 0) {
+		printf("读回状态失败: %s (%d)\n",
+		       total ? strerror(-total) : "无回包", total);
+		return 1;
+	}
+
+	rem = total;
+	for (h = (struct nlmsghdr *)resp; NLMSG_OK(h, rem); h = NLMSG_NEXT(h, rem)) {
+		struct genlmsghdr *gh;
+		struct nlattr *nla;
+		int arem;
+
+		if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR)
+			continue;
+		gh = (struct genlmsghdr *)NLMSG_DATA(h);
+		nla = (struct nlattr *)((char *)gh + GENL_HDRLEN);
+		arem = h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+		while (arem > 0 && NLA_OK(nla, arem)) {
+			if ((nla->nla_type & NLA_TYPE_MASK) == NL80211_ATTR_TESTDATA) {
+				struct nlattr *in = (struct nlattr *)((char *)nla + NLA_HDRLEN);
+				int irem = nla->nla_len - NLA_HDRLEN;
+
+				while (irem > 0 && NLA_OK(in, irem)) {
+					int it = in->nla_type & NLA_TYPE_MASK;
+					const void *p = (char *)in + NLA_HDRLEN;
+
+					if (it == MT76_TM_ATTR_STATE) {
+						uint32_t s = *(const uint32_t *)p;
+						printf("内核 testmode 状态: %u (%s)\n",
+						       s, state_name(s));
+						have = 1;
+					} else if (it == MT76_TM_ATTR_STATS) {
+						struct nlattr *st = (struct nlattr *)p;
+						int srem = in->nla_len - NLA_HDRLEN;
+						uint32_t pending = 0, queued = 0, done = 0;
+
+						while (srem > 0 && NLA_OK(st, srem)) {
+							int sit = st->nla_type & NLA_TYPE_MASK;
+							const void *sp = (char *)st + NLA_HDRLEN;
+
+							if (sit == 2)
+								pending = *(const uint32_t *)sp;
+							else if (sit == 3)
+								queued = *(const uint32_t *)sp;
+							else if (sit == 4)
+								done = *(const uint32_t *)sp;
+							st = NLA_NEXT(st, srem);
+						}
+						printf("  队列: pending=%u queued=%u done=%u\n",
+						       pending, queued, done);
+					}
+					in = NLA_NEXT(in, irem);
+				}
+			}
+			nla = NLA_NEXT(nla, arem);
+		}
+	}
+	if (!have)
+		printf("没解析到 testmode 状态（该 phy 可能不支持 dump）\n");
+	return have ? 0 : 1;
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
 "用法:\n"
 "  mt76tm status <ifname>            探测 testmode 是否可用\n"
-"  mt76tm cont   <ifname> [选项]     开始连续发射（干扰）\n"
+"  mt76tm check  <ifname>            只读：读回内核里的 testmode 状态\n"
+"  mt76tm cont   <ifname> [选项]     连续波（纯载波，依赖固件 RF_TEST）\n"
+"  mt76tm frames <ifname> [选项]     灌包（走 MAC 队列，更稳）\n"
 "  mt76tm off    <ifname>            停止并恢复正常\n"
 "\n"
-"连续发射选项:\n"
+"通用选项（cont / frames）:\n"
 "  -c <信道>   1-13，默认 1\n"
 "  -w <带宽>   20|40|80，默认 20\n"
-"  -m <模式>   cck|ofdm|ht|vht|he，默认 ofdm\n"
-"  -M <MCS>    0-11，默认 0\n"
-"  -n <流数>   1-2，默认 1\n"
-"  -a <天线>   1|3，默认 1\n"
-"  -p <功率>   0-31，默认 20\n");
+"  -m <模式>   cck|ofdm|ht|vht|he（cont 默认 ofdm，frames 默认 ht）\n"
+"  -M <MCS>    0-11\n"
+"  -n <流数>   1-2\n"
+"  -a <天线>   1|3\n"
+"  -p <功率>   0-31，默认 20\n"
+"\n"
+"frames 专用:\n"
+"  -l <字节>   每帧长度，默认 1500\n"
+"  -i <us>     帧间隔，默认 0（背靠背）\n"
+"  -d <百分比> 占空比 0-99，默认 99\n"
+"  -t <us>     每帧占用时长，默认 0\n"
+"  -x <帧数>   发多少帧，默认 1e9（够跑很久）\n");
 	exit(1);
 }
 
@@ -366,8 +606,60 @@ int main(int argc, char **argv)
 			fprintf(stderr, "关闭失败: %s\n", strerror(-ret));
 			return 1;
 		}
-		printf("已停止连续发射。\n");
-		return 0;
+		printf("已停止发射。\n");
+		return show_state(ifidx);
+	}
+
+	/* 只读：把内核里的 testmode 状态读回来（验证设的到底生效没有） */
+	if (!strcmp(cmd, "check") || !strcmp(cmd, "state"))
+		return show_state(ifidx);
+
+	if (!strcmp(cmd, "frames")) {
+		int chan = 1, width = 20, mode = MT76_TM_TX_MODE_HT;
+		int mcs = 7, nss = 2, ant = 3, pwr = 20, opt;
+		int len = 1500, ipg = 0, duty = 99, txtime = 0;
+		uint32_t count = 1000000000u;
+
+		optind = 3;
+		while ((opt = getopt(argc, argv, "c:w:m:M:n:a:p:l:i:d:t:x:")) != -1) {
+			switch (opt) {
+			case 'c': chan = atoi(optarg); break;
+			case 'w': width = atoi(optarg); break;
+			case 'm':
+				if (!strcmp(optarg, "cck")) mode = MT76_TM_TX_MODE_CCK;
+				else if (!strcmp(optarg, "ofdm")) mode = MT76_TM_TX_MODE_OFDM;
+				else if (!strcmp(optarg, "ht")) mode = MT76_TM_TX_MODE_HT;
+				else if (!strcmp(optarg, "vht")) mode = MT76_TM_TX_MODE_VHT;
+				else if (!strcmp(optarg, "he")) mode = MT76_TM_TX_MODE_HE_SU;
+				else usage();
+				break;
+			case 'M': mcs = atoi(optarg); break;
+			case 'n': nss = atoi(optarg); break;
+			case 'a': ant = atoi(optarg); break;
+			case 'p': pwr = atoi(optarg); break;
+			case 'l': len = atoi(optarg); break;
+			case 'i': ipg = atoi(optarg); break;
+			case 'd': duty = atoi(optarg); break;
+			case 't': txtime = atoi(optarg); break;
+			case 'x': count = (uint32_t)strtoul(optarg, NULL, 0); break;
+			default: usage();
+			}
+		}
+		if (duty > 99)
+			duty = 99;
+
+		printf("开始灌包: ch%d / %dMHz / mode=%d MCS=%d nss=%d ant=0x%x pwr=%d\n"
+		       "          长度=%d 字节 duty=%d%% ipg=%d us 帧数=%u\n",
+		       chan, width, mode, mcs, nss, ant, pwr, len, duty, ipg, count);
+
+		ret = testmode_frames_cmd(ifidx, MT76_TM_STATE_TX_FRAMES, chan, width,
+					  mode, mcs, nss, ant, pwr, len, ipg, duty,
+					  txtime, count);
+		if (ret < 0) {
+			fprintf(stderr, "失败: %s (%d)\n", strerror(-ret), -ret);
+			return 1;
+		}
+		return show_state(ifidx);
 	}
 
 	if (!strcmp(cmd, "cont")) {
@@ -424,8 +716,8 @@ int main(int argc, char **argv)
 					"  · nss 超过天线数\n");
 			return 1;
 		}
-		printf("已进入连续发射。停止: %s off %s\n", argv[0], ifname);
-		return 0;
+		printf("命令已下发。停止: %s off %s\n", argv[0], ifname);
+		return show_state(ifidx);
 	}
 
 	usage();
