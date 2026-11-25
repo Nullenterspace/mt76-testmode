@@ -197,6 +197,24 @@ do_collect() {
     tdir=$(find build_dir -path "*mt76tm*" -name "mt76tm" -type f | head -1)
     [ -n "$tdir" ] && cp "$tdir" "$OUT/" && log "  mt76tm  $(du -h "$tdir" | cut -f1)"
 
+    # ------------------------------------------------------------------
+    # 完整固件镜像 —— 这是最终要用的东西
+    #
+    # 为什么必须收镜像：实测「只替换 /lib/modules 里的模块」这条路走不通。
+    # 6 个模块全部同源、sizeof(struct module)=640、vermagic 全对，
+    # 内核加载时依然崩溃，而且崩溃会把 UBI 状态弄坏，连重刷 fit 都修不好
+    # （必须 mtd erase ubi 整片擦除才救得回来）。
+    #
+    # 直接刷这个镜像则是「一次编译、内核+驱动+testmode 全同源」，
+    # 而且 U-Boot 的 upgrade_fw 只重写 fit 卷，不碰 overlay 和 bootloader。
+    # ------------------------------------------------------------------
+    log "收集完整固件镜像（sysupgrade）"
+    local img
+    for img in $(find bin/targets -name "openwrt-*-squashfs-sysupgrade.itb" -type f 2>/dev/null); do
+        cp "$img" "$OUT/"
+        log "  $(basename "$img")  $(du -h "$img" | cut -f1)"
+    done
+
     log "产物清单："
     ls -la "$OUT"
 

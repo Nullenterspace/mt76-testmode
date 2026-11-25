@@ -58,6 +58,31 @@ MediaTek 开发者自己的描述：
                2402-2482 全频段 100% 饱和
 ```
 
+## ⚠️ 路线结论：**不要只换模块，要刷完整镜像**
+
+这条是花了两次变砖换来的，务必先看。
+
+**试过的错误做法**：只把 `cfg80211 / compat / mac80211 / mt76 / mt76-connac-lib / mt7915e`
+六个 `.ko` 传进路由器的 `/lib/modules/6.12.74/`，然后重启。
+
+**结果：内核启动循环，链路反复起落，机器变砖。** 而且：
+
+| 检查项 | 结果 |
+|---|---|
+| 6 个模块 `sizeof(struct module)` | 全部 640，与目标内核一致 ✓ |
+| vermagic | 全部 `6.12.74 SMP mod_unload aarch64` ✓ |
+| 是否同源（同一次构建） | 是，整套 6 个一起换 ✓ |
+| 内核加载 | **依然崩溃** |
+
+更麻烦的是：崩溃反复硬复位会把 **UBI 状态弄坏**，此后**重刷 `fit` 卷也修不好**，
+必须 `mtd erase ubi` 整片擦除才行（见下方「救砖」）。
+
+**正确做法：刷完整固件镜像。** 一次编译 → 内核、驱动、testmode、工具全部同源，
+不存在 overlay 写入，也不存在模块混搭；而 U-Boot 的 `upgrade_fw` 只重写 `fit` 卷，
+**不碰 overlay、不碰 bootloader**，风险比换模块低得多。
+
+所以 `build.sh collect` 会把 `openwrt-*-squashfs-sysupgrade.itb` 一起收进产物。
+
 ## 关键坑：模块必须和内核的 `struct module` 大小一致
 
 这是**最容易踩、报错也最莫名其妙**的一个坑，务必先看：
@@ -212,6 +237,32 @@ python tools/testmode.py rollback --node 1
 
 （内部就是 `cp /root/ko-bak-testmode/*.ko /lib/modules/6.12.74/ && reboot`）
 断电重启没用——模块在 overlay 上，必须换回旧文件。
+
+## 救砖（实测流程，2026-11-24 两次走通）
+
+换模块导致启动循环时，**按下面顺序**，前两步缺一不可：
+
+| 步骤 | 操作 | 作用 | 日志标志 |
+|---|---|---|---|
+| 1 | 断电 → 按住 **WPS 按钮** → 上电 15 秒 | 厂商流程：重写 BL2/FIP + **`mtd erase ubi`** | `RRQ bl2.img` → `RRQ fip.bin` → `RRQ customer`(404) |
+| 2 | 断电 → 按住 **Reset 孔** → 上电 15 秒 | `upgrade_fw`：写入 `fit` 卷 | `RRQ ...squashfs-sysupgrade.itb` |
+
+**只做第 2 步修不好**（实测：重刷 fit 后仍然循环），因为损坏在 UBI 层，不是系统分区。
+
+前置准备（PC 侧）：
+
+```powershell
+# tftp-root 里必须放齐这三个文件（横杠命名，无版本号前缀）：
+#   bl2.img       = 原厂 BL2 备份，1,048,576 字节（整分区）
+#   fip.bin       = 官方 ...-bl31-uboot.fip 补零到 2,097,152 字节
+#   openwrt-mediatek-filogic-netis_nx30v2-squashfs-sysupgrade.itb
+python tools\tftp_server.py --bind 192.168.1.254 --root tftp-root
+```
+
+> ⚠️ `bl2.img` / `fip.bin` 必须和机器现状**字节级一致**（前者用 `backup-original` 里的整分区备份，
+> 后者就是当初写进去的那个 FIP + 补零）。因为厂商流程用的是 `nand write $addr <分区>`
+> **不带长度**，文件不够大就会把内存里的垃圾写进 bootloader。
+> 写入期间**绝对不能断电**。
 
 ## 已知风险
 
