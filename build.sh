@@ -164,6 +164,30 @@ EOF
     log "确认配置："
     grep -q '^CONFIG_PACKAGE_CFG80211_TESTMODE=y' .config || die "testmode 开关丢失"
     grep -q '^CONFIG_PACKAGE_mt76tm=y' .config || die "mt76tm 未启用"
+
+    # ------------------------------------------------------------------
+    # 注入 mt76 自定义补丁（EDCCA 调试接口）
+    #
+    # mt76 是 package/kernel/mt76（外部源码包），补丁放它自己的 patches/ 目录，
+    # OpenWrt 的 quilt 机制会在解包后自动 apply。
+    #
+    # 作用：给 mt7915 增加 /sys/kernel/debug/ieee80211/phy0/mt76/edcca，
+    # 可以抬高/关闭空口能量检测（EDCCA）阈值 —— 关掉之后射频不再因为
+    # “听到别人” 而退避，占空比能明显提高。
+    #
+    # ⚠️ 只在用户主动 echo 时才下发 MCU 命令；固件不支持时只会那一条失败。
+    # ------------------------------------------------------------------
+    if [ -d "$ROOT/patches/mt76" ]; then
+        log "注入 mt76 补丁"
+        mkdir -p package/kernel/mt76/patches
+        for p in "$ROOT"/patches/mt76/*.patch; do
+            [ -f "$p" ] || continue
+            cp "$p" package/kernel/mt76/patches/
+            log "  $(basename "$p")"
+        done
+        ls package/kernel/mt76/patches/
+    fi
+
     log "配置完成"
 }
 

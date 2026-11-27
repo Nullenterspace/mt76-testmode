@@ -7,3 +7,4 @@
 Makefile text eol=lf
 *.buildinfo text eol=lf
 *.py text eol=lf
+*.patch text eol=lf

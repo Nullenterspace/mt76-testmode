@@ -1,0 +1,176 @@
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index fd9cf9c..61f3153 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1270,6 +1270,7 @@ enum {
+ 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
+ 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
++	MCU_EXT_CMD_EDCCA = 0xba,
+ 	MCU_EXT_CMD_WF_RF_PIN_CTRL = 0xbd,
+ };
+ 
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index e80d154..5ff5fcb 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1289,6 +1289,60 @@ mt7915_rf_regval_set(void *data, u64 val)
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_rf_regval, mt7915_rf_regval_get,
+ 			 mt7915_rf_regval_set, "0x%08llx\n");
+ 
++/* EDCCA control (raise/disable the energy-detect CCA threshold).
++ *
++ * Usage:
++ *   echo off              > /sys/kernel/debug/ieee80211/phy0/mt76/edcca
++ *   echo auto             > /sys/kernel/debug/ieee80211/phy0/mt76/edcca
++ *   echo "thresh 90 90 90" > /sys/kernel/debug/ieee80211/phy0/mt76/edcca
++ *
++ * With EDCCA disabled the radio no longer defers because of energy heard on
++ * the channel, so the own tx airtime goes up (at the cost of being less
++ * friendly to neighbours). The MCU command may be unsupported by the
++ * firmware; that only fails this one call, it is never issued implicitly.
++ */
++static ssize_t
++mt7915_edcca_write(struct file *file, const char __user *user_buf,
++		   size_t count, loff_t *ppos)
++{
++	struct mt7915_phy *phy = file->private_data;
++	char buf[64];
++	unsigned int v1, v2, v3;
++	int ret;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	if (count && buf[count - 1] == '\n')
++		buf[count - 1] = '\0';
++
++	if (!strcmp(buf, "off"))
++		ret = mt7915_mcu_set_edcca(phy, MT7915_EDCCA_CTRL_SET_EN,
++					   MT7915_EDCCA_MODE_FORCE_DISABLE,
++					   0, 0, 0);
++	else if (!strcmp(buf, "auto"))
++		ret = mt7915_mcu_set_edcca(phy, MT7915_EDCCA_CTRL_SET_EN,
++					   MT7915_EDCCA_MODE_AUTO, 0, 0, 0);
++	else if (sscanf(buf, "thresh %u %u %u", &v1, &v2, &v3) == 3)
++		ret = mt7915_mcu_set_edcca(phy, MT7915_EDCCA_CTRL_SET_THERS, 0,
++					   min_t(unsigned int, v1, 255),
++					   min_t(unsigned int, v2, 255),
++					   min_t(unsigned int, v3, 255));
++	else
++		return -EINVAL;
++
++	return ret ? ret : count;
++}
++
++static const struct file_operations fops_edcca = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = mt7915_edcca_write,
++	.llseek = default_llseek,
++};
++
+ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+@@ -1324,6 +1378,7 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "twt_stats", dir,
+ 				    mt7915_twt_stats);
+ 	debugfs_create_file("rf_regval", 0600, dir, dev, &fops_rf_regval);
++	debugfs_create_file("edcca", 0200, dir, phy, &fops_edcca);
+ 
+ 	if (!dev->dbdc_support || phy->mt76->band_idx) {
+ 		debugfs_create_u32("dfs_hw_pattern", 0400, dir,
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 6625f90..79bf8c3 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -4231,3 +4231,49 @@ int mt7915_mcu_rf_regval(struct mt7915_dev *dev, u32 regidx, u32 *val, bool set)
+ 
+ 	return 0;
+ }
++
++/* EDCCA (energy detect CCA) control, using the vendor MCU command 0xba.
++ *
++ * mode:
++ *   MT7915_EDCCA_CTRL_SET_EN    -> enable: EDCCA_MODE_FORCE_DISABLE(0) turns the
++ *                                  energy detect off, EDCCA_MODE_AUTO(1) hands
++ *                                  control back to the firmware
++ *   MT7915_EDCCA_CTRL_SET_THERS -> pri20/sec40/sec80 thresholds (firmware units)
++ *
++ * The command is not guaranteed to be implemented by the firmware (unknown for
++ * the MT7981 WM firmware); if it is not, the MCU call times out. It is only
++ * issued from the debugfs file, i.e. when the user asks for it explicitly.
++ */
++int mt7915_mcu_set_edcca(struct mt7915_phy *phy, u8 mode, u8 enable,
++			 u8 pri20, u8 sec40, u8 sec80)
++{
++	struct mt7915_dev *dev = phy->dev;
++	struct {
++		u8 band_idx;
++		u8 cmd_idx;
++		u8 setting[3];
++		bool record_in_fw;
++		u8 region;
++		s8 thres_compensation;
++	} __packed req = {
++		.band_idx = phy->mt76->band_idx,
++		.cmd_idx = mode,
++		.record_in_fw = false,
++	};
++
++	switch (mode) {
++	case MT7915_EDCCA_CTRL_SET_EN:
++		req.setting[0] = enable;
++		break;
++	case MT7915_EDCCA_CTRL_SET_THERS:
++		req.setting[0] = pri20;
++		req.setting[1] = sec40;
++		req.setting[2] = sec80;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(EDCCA),
++				 &req, sizeof(req), true);
++}
+diff --git a/mt7915/mcu.h b/mt7915/mcu.h
+index ba5e410..c81d0de 100644
+--- a/mt7915/mcu.h
++++ b/mt7915/mcu.h
+@@ -542,4 +542,19 @@ enum {
+ 					 sizeof(struct bss_info_bmc_rate) +\
+ 					 sizeof(struct bss_info_ext_bss))
+ 
++/* EDCCA (energy detect CCA) control, vendor MCU command 0xba.
++ * Driven by the debugfs "edcca" file to raise/disable energy detect.
++ */
++enum {
++	MT7915_EDCCA_CTRL_SET_EN = 0,
++	MT7915_EDCCA_CTRL_SET_THERS,
++	MT7915_EDCCA_CTRL_GET_EN,
++	MT7915_EDCCA_CTRL_GET_THERS,
++};
++
++enum {
++	MT7915_EDCCA_MODE_FORCE_DISABLE = 0,
++	MT7915_EDCCA_MODE_AUTO,
++};
++
+ #endif
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index b2fc713..aca120d 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -504,6 +504,8 @@ int mt7915_mcu_set_fixed_rate_ctrl(struct mt7915_dev *dev,
+ int mt7915_mcu_set_eeprom(struct mt7915_dev *dev);
+ int mt7915_mcu_get_eeprom(struct mt7915_dev *dev, u32 offset, u8 *read_buf);
+ int mt7915_mcu_get_eeprom_free_block(struct mt7915_dev *dev, u8 *block_num);
++int mt7915_mcu_set_edcca(struct mt7915_phy *phy, u8 mode, u8 enable,
++			 u8 pri20, u8 sec40, u8 sec80);
+ int mt7915_mcu_set_mac(struct mt7915_dev *dev, int band, bool enable,
+ 		       bool hdr_trans);
+ int mt7915_mcu_set_test_param(struct mt7915_dev *dev, u8 param, bool test_mode,
